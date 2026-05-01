@@ -50,7 +50,7 @@ class LLMModel(BaseModel):
 
     def has_json_mode(self) -> bool:
         """Check if the model supports JSON mode"""
-        if self.is_deepseek() or self.is_gemini():
+        if self.is_deepseek() or self.is_gemini() or self.provider == ModelProvider.ANTHROPIC:
             return False
         # Only certain Ollama models support JSON mode
         if self.is_ollama():
