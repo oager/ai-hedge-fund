@@ -31,7 +31,12 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
 
         progress.update_status(agent_id, ticker, "Analyzing trading patterns")
 
-        # Get the signals from the insider trades
+        # Get the signals from the insider trades.
+        # transaction_shares is nullable -- that is why .dropna() is here -- so the
+        # post-filter list is NOT a fetch count. Same trap the news leg had: reporting
+        # "no insider trades returned" when 40 Form 4 rows came back with null share
+        # counts is a false statement about the fetch.
+        trades_fetched = len(insider_trades)
         transaction_shares = pd.Series([t.transaction_shares for t in insider_trades]).dropna()
         insider_signals = np.where(transaction_shares < 0, "bearish", "bullish").tolist()
 
@@ -40,10 +45,22 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
         # Get the company news
         company_news = get_company_news(ticker, end_date, limit=100, api_key=api_key)
 
-        # Get the sentiment from the company news
+        # Get the sentiment from the company news.
+        # The provider does NOT populate CompanyNews.sentiment -- every article comes
+        # back with sentiment=None, so .dropna() empties the series and this leg
+        # contributes nothing. Keep the fetched count separately: reporting
+        # total_articles=0 when 10 articles were fetched reads as "no news exists"
+        # rather than "the sentiment field was empty", and that inflated this agent
+        # to BULLISH 100% on NKE (insider-only) while the separate news_sentiment
+        # agent scored BEARISH 80.5% on the same 5-10 articles by classifying text.
+        articles_fetched = len(company_news)
         sentiment = pd.Series([n.sentiment for n in company_news]).dropna()
+        articles_usable = len(sentiment)
         news_signals = np.where(sentiment == "negative", "bearish", 
                               np.where(sentiment == "positive", "bullish", "neutral")).tolist()
+        # Partial loss matters too: 3 usable of 10 still applies the full 0.7 weight
+        # to a 70%-discarded sample, and "ok" would hide that.
+        news_leg_degraded = articles_fetched > 0 and articles_usable < articles_fetched
         
         progress.update_status(agent_id, ticker, "Combining signals")
         # Combine signals from both sources with weights
@@ -80,6 +97,8 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
                          "bearish" if insider_signals.count("bearish") > insider_signals.count("bullish") else "neutral",
                 "confidence": round((max(insider_signals.count("bullish"), insider_signals.count("bearish")) / max(len(insider_signals), 1)) * 100),
                 "metrics": {
+                    "trades_fetched": trades_fetched,
+                    "trades_with_usable_share_count": len(insider_signals),
                     "total_trades": len(insider_signals),
                     "bullish_trades": insider_signals.count("bullish"),
                     "bearish_trades": insider_signals.count("bearish"),
@@ -93,6 +112,8 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
                          "bearish" if news_signals.count("bearish") > news_signals.count("bullish") else "neutral",
                 "confidence": round((max(news_signals.count("bullish"), news_signals.count("bearish")) / max(len(news_signals), 1)) * 100),
                 "metrics": {
+                    "articles_fetched": articles_fetched,
+                    "articles_with_usable_sentiment": articles_usable,
                     "total_articles": len(news_signals),
                     "bullish_articles": news_signals.count("bullish"),
                     "bearish_articles": news_signals.count("bearish"),
@@ -101,6 +122,32 @@ def sentiment_analyst_agent(state: AgentState, agent_id: str = "sentiment_analys
                     "weighted_bullish": round(news_signals.count("bullish") * news_weight, 1),
                     "weighted_bearish": round(news_signals.count("bearish") * news_weight, 1),
                 }
+            },
+            "data_quality": {
+                # Four states per leg, and "ok" is only one of them. The zero-fetch
+                # arm has to come FIRST: both DEGRADED arms require a non-zero fetch,
+                # so without it a thinly-covered ticker returns no news at all, the
+                # 0.7-weight leg contributes nothing, and the agent still stamps the
+                # result "ok" -- the exact NKE failure, one branch over.
+                "news_leg": (
+                    "no company news returned" if not articles_fetched else
+                    ("DEGRADED (total): %d articles fetched but none carried a usable "
+                     "sentiment field, so this signal is insider-only and its confidence "
+                     "reflects one of two intended legs" % articles_fetched)
+                    if articles_usable == 0 else
+                    ("DEGRADED (partial): %d of %d fetched articles carried a usable "
+                     "sentiment field; the full news weight is applied to that subset"
+                     % (articles_usable, articles_fetched))
+                    if news_leg_degraded else "ok"),
+                "insider_leg": (
+                    "no insider trades returned" if not trades_fetched else
+                    ("DEGRADED (total): %d trades fetched, none with a usable share count"
+                     % trades_fetched)
+                    if not insider_signals else
+                    ("DEGRADED (partial): %d of %d fetched trades carried a usable share "
+                     "count; the full insider weight is applied to that subset"
+                     % (len(insider_signals), trades_fetched))
+                    if len(insider_signals) < trades_fetched else "ok"),
             },
             "combined_analysis": {
                 "total_weighted_bullish": round(bullish_signals, 1),
